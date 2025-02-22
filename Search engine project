@@ -1,0 +1,318 @@
+pip install aiohttp feedparser pandas beautifulsoup4 fastapi uvicorn nest_asyncio
+
+# ---- CRAWLER ----
+
+import aiohttp
+import asyncio
+from bs4 import BeautifulSoup
+import logging
+import os
+import json
+import nest_asyncio
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class MaxPagesReached(Exception):
+    pass
+
+async def fetch_content(session, url):
+    logger.info(f"Fetching content from: {url}")
+    async with session.get(url) as response:
+        return await response.text()
+
+def clean_content(html_content):
+    soup = BeautifulSoup(html_content, "html.parser")
+    for script in soup(["script", "style"]):
+        script.extract()
+    text = soup.get_text()
+    lines = (line.strip() for line in text.splitlines())
+    chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+    cleaned_text = " ".join(chunk for chunk in chunks if chunk)
+    return cleaned_text
+
+def extract_links(html_content, base_url):
+    soup = BeautifulSoup(html_content, "html.parser")
+    links = soup.find_all('a', href=True)
+    valid_links = set()
+    for link in links:
+        href = link['href']
+        if href.startswith('/wiki/') and ':' not in href:
+            valid_links.add(base_url + href)
+    return valid_links
+
+async def save_content(url, content, save_dir):
+    try:
+        filename = os.path.join(save_dir, f"{url.replace('https://', '').replace('http://', '').replace('/', '_')}.json")
+        webpage_data = {
+            'url': url,
+            'content': content
+        }
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(webpage_data, f, ensure_ascii=False, indent=4)
+        logger.info(f"Saved content for {url}")
+    except Exception as e:
+        logger.error(f"Error saving content for {url}: {e}")
+
+async def process_page(session, url, keyword, visited_urls, depth, max_depth, max_pages, page_count, save_dir):
+    if depth > max_depth or url in visited_urls or page_count[0] >= max_pages:
+        return []
+
+    try:
+        content = await fetch_content(session, url)
+        cleaned_content = clean_content(content)
+        visited_urls.add(url)
+        await save_content(url, cleaned_content, save_dir)
+        page_count[0] += 1
+        logger.info(f"Crawled {page_count[0]} pages so far")
+
+        if page_count[0] >= max_pages:
+            raise MaxPagesReached("Maximum number of pages reached")
+
+        if keyword.lower() in cleaned_content.lower():
+            links = extract_links(content, "https://en.wikipedia.org")
+            logger.info(f"Found {len(links)} links on page: {url}")
+            tasks = [
+                process_page(session, link, keyword, visited_urls, depth + 1, max_depth, max_pages, page_count, save_dir)
+                for link in links if link not in visited_urls and page_count[0] < max_pages
+            ]
+            results = await asyncio.gather(*tasks)
+            return [(url, cleaned_content)] + [item for sublist in results for item in sublist]
+        else:
+            return [(url, cleaned_content)]
+    except MaxPagesReached as e:
+        logger.error(f"Stopping the crawler: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Error processing page {url}: {e}")
+        return []
+
+async def main_crawl(start_url, keyword, save_dir, max_depth, max_pages):
+    visited_urls = set()
+    page_count = [0]
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            await process_page(session, start_url, keyword, visited_urls, 0, max_depth, max_pages, page_count, save_dir)
+        except MaxPagesReached:
+            pass
+
+    logger.info(f"Crawling completed. Total pages crawled: {page_count[0]}")
+    return page_count[0]
+
+# ---- CRAWLING ----
+
+import nest_asyncio
+nest_asyncio.apply()
+
+# Set the directory where you want to save the crawled data
+save_dir = './crawled_data'
+
+# Create the save directory if it doesn't exist
+if not os.path.exists(save_dir):
+    os.makedirs(save_dir)
+
+# Call the main_crawl function with the save_dir argument
+pages_crawled = await main_crawl("https://en.wikipedia.org/wiki/Medication", "Medication", save_dir, max_depth=1, max_pages=341)
+print(f"Total pages crawled: {pages_crawled}")
+
+# ---- INDEXER ----
+
+import os
+import json
+from collections import defaultdict
+from math import log
+
+class SearchEngine:
+    def __init__(self, data_dir):
+        self.data_dir = data_dir
+        self.index = defaultdict(list)
+        self.document_contents = {}
+        self.document_lengths = {}
+        self.total_documents = 0
+        self.load_data()
+
+    def load_data(self):
+        if os.path.exists(self.data_dir):
+            for filename in os.listdir(self.data_dir):
+                if filename.endswith('.json'):
+                    filepath = os.path.join(self.data_dir, filename)
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        webpage_data = json.load(f)
+                        self.index_document(webpage_data['url'], webpage_data['content'])
+
+    def index_document(self, url, content):
+        words = content.split()
+        self.document_lengths[url] = len(words)
+        self.document_contents[url] = content
+        for word in words:
+            self.index[word].append(url)
+        self.total_documents += 1
+
+    def bulk_index(self, content_list):
+        for url, content in content_list:
+            self.index_document(url, content)
+
+    def search(self, query):
+        words = query.split()
+        results = defaultdict(int)
+        for word in words:
+            if word in self.index:
+                doc_freq = len(self.index[word])
+                for url in self.index[word]:
+                    tf = self.index[word].count(url)
+                    idf = log(self.total_documents / (1 + doc_freq))
+                    results[url] += tf * idf
+        sorted_results = sorted(results.items(), key=lambda x: x[1], reverse=True)
+        return sorted_results
+
+    @property
+    def number_of_documents(self):
+        return self.total_documents
+
+
+# ---- RANKER ----
+
+class SearchEngineWithRanking(SearchEngine):
+    def __init__(self, data_dir, k1: float = 1.5, b: float = 0.75):
+        super().__init__(data_dir)
+        self.k1 = k1
+        self.b = b
+    
+    def search(self, query):
+        words = query.split()
+        results = {}
+        for word in words:
+            if word in self.index:
+                for url in self.index[word]:
+                    if url not in results:
+                        results[url] = 0
+                    # Applying BM25 ranking formula (simplified)
+                    results[url] += (self.k1 + 1) / (self.k1 * ((1 - self.b) + self.b * (len(self.index[word]) / self.avdl)) + 1)
+        results = {url: round(score, 3) for url, score in results.items()}
+        return results
+    
+    @property
+    def avdl(self):
+        return sum(len(d) for d in self.index.values()) / len(self.index)
+
+
+# ---- PAGER ----
+
+def get_snippets(content, query):
+    query = query.lower()
+    sentences = content.split('.')
+    
+    for sentence in sentences:
+        lower_sentence = sentence.lower()
+        if query in lower_sentence:
+            # Find the position of the query phrase
+            start_index = lower_sentence.find(query)
+            end_index = start_index + len(query)
+            highlighted_query = f"<b>{sentence[start_index:end_index]}</b>"
+            # Build the snippet with "[...]" after the query phrase
+            snippet = sentence[:start_index] + highlighted_query + " [...]"
+            return [snippet.strip()]
+    
+    return ["No snippet available"]
+
+# ---- INTERFACE ----
+
+import nest_asyncio
+import uvicorn
+import os
+import json
+import logging
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+
+nest_asyncio.apply()
+
+# FastAPI setup
+app = FastAPI()
+
+# Define the search engine with the data directory
+data_dir = './crawled_data'
+engine = SearchEngineWithRanking(data_dir, k1=2.0, b=0.75)
+
+# Optimized bulk index
+def bulk_index_optimized(engine, data_dir):
+    content = []
+    for file_name in os.listdir(data_dir):
+        if file_name.endswith('.json'):
+            file_path = os.path.join(data_dir, file_name)
+            with open(file_path, 'r') as file:
+                data = json.load(file)
+                if 'url' in data and 'content' in data:
+                    content.append((data['url'], data['content']))
+    engine.bulk_index(content)
+
+# Call optimized bulk index
+bulk_index_optimized(engine, data_dir)
+
+# Verify the number of documents indexed
+print(f"Number of documents indexed: {engine.number_of_documents}")
+
+# Setting up templates and static files
+templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+def get_top_urls(scores_dict: dict, n: int):
+    sorted_urls = sorted(scores_dict.items(), key=lambda x: x[1], reverse=True)
+    top_n_urls = sorted_urls[:n]
+    top_n_dict = dict(top_n_urls)
+    return top_n_dict
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    posts = engine.number_of_documents
+    return templates.TemplateResponse(
+        "index.html", {"request": request, "posts": posts}
+    )
+
+@app.get("/results", response_class=HTMLResponse)
+async def search_results(request: Request, query: str = None):
+    logging.debug(f"Full request: {request.url}")
+    logging.debug(f"Query parameters: {request.query_params}")
+    logging.debug(f"Query parameter received: {query}")
+
+    if query is None:
+        logging.debug("Query parameter is missing")
+        return JSONResponse(
+            status_code=400,
+            content={"detail": [{"loc": ["query", "query"], "msg": "field required", "type": "value_error.missing"}]}
+        )
+
+    logging.debug(f"Received query: {query}")
+
+    results = engine.search(query)
+    top_results = get_top_urls(results, n=5)
+
+    search_results_data = []
+    for url, score in top_results.items():
+        content = engine.document_contents.get(url, "")
+        snippet_list = get_snippets(content, query)
+        snippet = ' '.join(snippet_list) if snippet_list else "No snippet available"
+        title = url.split('/')[-1].replace('_', ' ')  # Default to last part of URL
+        search_results_data.append({
+            "url": url,
+            "title": title,
+            "snippet": snippet,
+            "score": score
+        })
+
+    return templates.TemplateResponse(
+        "results.html", {"request": request, "query": query, "results": search_results_data}
+    )
+
+@app.get("/about", response_class=HTMLResponse)
+async def read_about(request: Request):
+    logging.debug("About page accessed")
+    return templates.TemplateResponse("about.html", {"request": request})
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8001)
+
+
